@@ -1,5 +1,7 @@
 """Single-file interactive mirror tool for Autodesk Maya."""
 
+from contextlib import contextmanager
+from functools import wraps
 import traceback
 import json
 
@@ -38,6 +40,41 @@ AXIS_DATA = {
 
 _ACTIVE_JOB_ID = None
 _CALLBACK_BUSY = False
+
+
+@contextmanager
+def _suspend_undo_recording():
+    """Temporarily disable Undo recording without clearing the queue."""
+    undo_was_enabled = bool(
+        cmds.undoInfo(
+            query=True,
+            state=True,
+        )
+    )
+
+    try:
+        if undo_was_enabled:
+            cmds.undoInfo(
+                stateWithoutFlush=False,
+            )
+
+        yield
+
+    finally:
+        if undo_was_enabled:
+            cmds.undoInfo(
+                stateWithoutFlush=True,
+            )
+
+
+def _without_undo(function):
+    """Run a function without adding temporary work to Maya's Undo queue."""
+    @wraps(function)
+    def wrapped(*args, **kwargs):
+        with _suspend_undo_recording():
+            return function(*args, **kwargs)
+
+    return wrapped
 
 
 def _as_transform(node):
@@ -559,6 +596,7 @@ def _unparent_foreign_children(controller):
                 pass
 
 
+@_without_undo
 def _delete_controller(
     controller,
     kill_job=True,
@@ -1052,7 +1090,8 @@ def _execute_mirror_deferred(
         controller = None
 
         if not history_enabled:
-            cmds.constructionHistory(toggle=True)
+            with _suspend_undo_recording():
+                cmds.constructionHistory(toggle=True)
 
         cmds.undoInfo(
             openChunk=True,
@@ -1204,7 +1243,8 @@ def _execute_mirror_deferred(
             cmds.undoInfo(closeChunk=True)
 
         if not history_enabled:
-            cmds.constructionHistory(toggle=False)
+            with _suspend_undo_recording():
+                cmds.constructionHistory(toggle=False)
 
         _CALLBACK_BUSY = False
 
@@ -1272,6 +1312,7 @@ def _create_coordinate_group(
     return group
 
 
+@_without_undo
 def start_mirror_session(
     target=None,
     mode="world",
@@ -1308,15 +1349,26 @@ def start_mirror_session(
         )
 
     if mode == "custom":
-        if len(transforms) != 2:
+        if len(transforms) not in (1, 2):
             raise RuntimeError(
-                "Custom mode requires exactly two objects. "
-                "Select the polygon target first, then the reference."
+                "Custom mode requires one or two objects. "
+                "Select the polygon target first and, optionally, "
+                "a reference object second."
             )
 
-        reference = transforms[1]
+        # With one selected object, use the target itself as the
+        # coordinate reference. This is equivalent to using a duplicate
+        # of the target as the second selected reference object.
+        reference = (
+            transforms[1]
+            if len(transforms) == 2
+            else target_transform
+        )
 
-        if reference == target_transform:
+        if (
+            len(transforms) == 2
+            and reference == target_transform
+        ):
             raise RuntimeError(
                 "The target and reference must be different objects."
             )
@@ -1336,8 +1388,11 @@ def start_mirror_session(
                 "World mode requires one selected polygon."
             )
 
-        controller_position = _target_center(
-            target_transform
+        # World mode always displays its controller at the world origin.
+        controller_position = (
+            0.0,
+            0.0,
+            0.0,
         )
 
         controller_rotation = (
